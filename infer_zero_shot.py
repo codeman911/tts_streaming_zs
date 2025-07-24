@@ -271,12 +271,16 @@ def _parse_args():
     group.add_argument("--target_text", help="Single text to synthesise")
     group.add_argument("--sentences_file", help="Path to txt file with sentences (one per line)")
     p.add_argument("--output_folder", default="outputs", help="Directory to write WAV files")
+    # Hidden param used for internal single-synthesis runs
+    p.add_argument("--output", help=argparse.SUPPRESS)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--repetition_penalty", type=float, default=1.1)
     return p.parse_args()
 
 
 def main():
+    import subprocess, sys, shlex
+
     args = _parse_args()
     assert os.path.exists(args.reference_audio), "Reference audio not found"
 
@@ -289,26 +293,45 @@ def main():
     else:
         targets = DEFAULT_SENTENCES
 
-    os.makedirs(args.output_folder, exist_ok=True)
-
-    for idx, sentence in enumerate(targets, 1):
-        # Create fresh engine each iteration to avoid async engine shutdown issues
+    # If --output was supplied we perform a single synthesis and exit
+    if getattr(args, "output", None):
         engine = ZeroShotTTSInference(args.model)
-
-        safe_name = f"{idx}.wav"
-        out_path = os.path.join(args.output_folder, safe_name)
-        logger.info("Synthesising %d/%d: %s -> %s", idx, len(targets), sentence, out_path)
         engine.generate(
             reference_audio=args.reference_audio,
             reference_text=args.reference_text,
-            target_text=sentence,
-            output_path=out_path,
+            target_text=args.target_text,
+            output_path=args.output,
             temperature=args.temperature,
             repetition_penalty=args.repetition_penalty,
         )
+        return
+
+    # Batch mode – spawn a fresh python process for each sentence to avoid engine shutdown
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    script_path = os.path.abspath(__file__)
+
+    for idx, sentence in enumerate(targets, 1):
+        safe_name = f"{idx}.wav"
+        out_path = os.path.join(args.output_folder, safe_name)
+        cmd = [
+            sys.executable,
+            script_path,
+            "--model", args.model,
+            "--reference_audio", args.reference_audio,
+            "--reference_text", args.reference_text,
+            "--target_text", sentence,
+            "--output", out_path,
+            "--temperature", str(args.temperature),
+            "--repetition_penalty", str(args.repetition_penalty),
+        ]
+        logger.info("[Batch] Running: %s", shlex.join(cmd))
+        subprocess.run(cmd, check=True)
+
 
 
 if __name__ == "__main__":
     main()
+
 
 
