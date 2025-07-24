@@ -188,7 +188,12 @@ class ZeroShotTTSInference:
 
         prompt_ids = torch.cat(
             [
-                # No reference-text turn; start directly with AI + reference audio
+                # Human turn with reference text (REQUIRED for proper zero-shot inference)
+                sohu,
+                ref_text_ids,
+                eot,
+                eohu,
+                # AI turn with reference audio
                 soai,
                 sos,
                 ref_audio_ids,
