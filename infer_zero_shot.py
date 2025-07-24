@@ -153,13 +153,13 @@ class ZeroShotTTSInference:
         all_codes: List[int] = []
         base = TOKENS["audio_tokens_start"]
         for i in range(codes[0].shape[-1]):
-            all_codes.append(codes[0][0, i].item() + base)  # q-1
-            all_codes.append(codes[2][0, 4 * i].item() + base + 4096)
-            all_codes.append(codes[2][0, 4 * i + 1].item() + base + 8192)
-            all_codes.append(codes[1][0, 2 * i + 1].item() + base + 12288)
-            all_codes.append(codes[2][0, 4 * i + 2].item() + base + 16384)
-            all_codes.append(codes[2][0, 4 * i + 3].item() + base + 20480)
-            all_codes.append(codes[1][0, 2 * i].item() + base + 24576)
+            all_codes.append(codes[0][0, i].item() + base)
+            all_codes.append(codes[1][0, 2 * i].item() + base + 4096)
+            all_codes.append(codes[2][0, 4 * i].item() + base + 8192)
+            all_codes.append(codes[2][0, 4 * i + 1].item() + base + 12288)
+            all_codes.append(codes[1][0, 2 * i + 1].item() + base + 16384)
+            all_codes.append(codes[2][0, 4 * i + 2].item() + base + 20480)
+            all_codes.append(codes[2][0, 4 * i + 3].item() + base + 24576)
         return _deduplicate_frames(all_codes)
 
     # ------------------------------------------------------------------
