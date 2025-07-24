@@ -135,7 +135,7 @@ class ZeroShotTTSInference:
             waveform = waveform.to(self.device)
 
         with torch.no_grad():
-            codes = self.snac.encode(waveform)["codes"]  # tuple of 3 levels
+            codes = self.snac.encode(waveform)  # tuple/list with 3 tensors
         # Interleave 7-code frames exactly like training code
         all_codes: List[int] = []
         base = TOKENS["audio_tokens_start"]
@@ -217,13 +217,30 @@ class ZeroShotTTSInference:
 
         logger.info("Generating speech…")
         start = time.monotonic()
-        # `generate_speech` handles decoding + waveform writing via streaming
-        self.model.generate_speech(
-            prompt,
-            output_path,
+
+        # Generate tokens stream from the model
+        token_gen = self.model.generate_tokens_sync(
+            prompt=prompt,
             temperature=temperature,
+            top_p=0.95,
             repetition_penalty=repetition_penalty,
+            stop_token_ids=[TOKENS["end_of_speech"], TOKENS["end_of_ai"]],
+            max_tokens=4096,
         )
+
+        # Decode tokens → audio chunks
+        audio_chunks = tokens_decoder_sync(token_gen)
+
+        # Write wav incrementally
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
+        with wave.open(output_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)  # 16-bit
+            wf.setframerate(24_000)
+            for chunk in audio_chunks:
+                if chunk:
+                    wf.writeframes(chunk)
+
         dur = time.monotonic() - start
         logger.info("Saved %s (%.2f s)", output_path, dur)
         return output_path
@@ -236,7 +253,7 @@ def _parse_args():
     p = argparse.ArgumentParser(description="Zero-shot TTS inference (training-aligned prompt)")
     p.add_argument("--model", required=True, help="Path to Orpheus checkpoint")
     p.add_argument("--reference_audio", required=True, help="Reference WAV/FLAC/OGG")
-    p.add_argument("--reference_text", default="وخالي المعطية إلى الليلة خوي. وكان هناك فتاة المجلس الصيفي لا مش نال. ", help="Transcript of reference audio")
+    p.add_argument("--reference_text", required=True, help="Transcript of reference audio")
     p.add_argument("--target_text", required=True, help="Text to synthesise")
     p.add_argument("--output", default="output.wav", help="Destination WAV file")
     p.add_argument("--temperature", type=float, default=0.7)
@@ -262,4 +279,3 @@ def main():
 if __name__ == "__main__":
     main()
 
-#    وخالي المعطية إلى الليلة خوي. وكان هناك فتاة المجلس الصيفي لا مش نال.  
