@@ -188,23 +188,20 @@ class ZeroShotTTSInference:
 
         prompt_ids = torch.cat(
             [
-                sohu,
-                ref_text_ids,
-                eot,
-                eohu,
+                # No reference-text turn; start directly with AI + reference audio
                 soai,
                 sos,
                 ref_audio_ids,
                 eospeech,
                 eoai,
+                # Human turn with target text
                 sohu,
                 tgt_text_ids,
                 eot,
                 eohu,
+                # AI begins generation
                 soai,
-                sos,
-                ref_audio_ids[: AUDIO_FRAME_SIZE * 7],  # first 7 frames = 49 codes
-                sos  # <-- generation starts after this
+                sos,  # <-- generation starts after this
             ],
             dim=0,
         )
