@@ -202,7 +202,9 @@ class ZeroShotTTSInference:
                 eot,
                 eohu,
                 soai,
-                sos,  # <-- generation starts after this
+                sos,
+                ref_audio_ids[: AUDIO_FRAME_SIZE * 7],  # first 7 frames = 49 codes
+                sos  # <-- generation starts after this
             ],
             dim=0,
         )
@@ -266,7 +268,7 @@ def _parse_args():
     p = argparse.ArgumentParser(description="Zero-shot TTS inference (training-aligned prompt)")
     p.add_argument("--model", required=True, help="Path to Orpheus checkpoint")
     p.add_argument("--reference_audio", required=True, help="Reference WAV/FLAC/OGG")
-    p.add_argument("--reference_text", default="""A lot of men, especially Arabs, get really challenged because they see what they've been told they can't have or they shouldn't have. It's wrong. They end up with women that their moms will never agree to waste three, four years of their life and hers and then get lost and then maybe go back to what they were.""", help="Transcript of reference audio")
+    p.add_argument("--reference_text", required=True, help="Transcript of reference audio")
     group = p.add_mutually_exclusive_group(required=False)
     group.add_argument("--target_text", help="Single text to synthesise")
     group.add_argument("--sentences_file", help="Path to txt file with sentences (one per line)")
@@ -332,6 +334,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
