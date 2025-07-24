@@ -266,7 +266,7 @@ def _parse_args():
     p = argparse.ArgumentParser(description="Zero-shot TTS inference (training-aligned prompt)")
     p.add_argument("--model", required=True, help="Path to Orpheus checkpoint")
     p.add_argument("--reference_audio", required=True, help="Reference WAV/FLAC/OGG")
-    p.add_argument("--reference_text", required=True, help="Transcript of reference audio")
+    p.add_argument("--reference_text", default="""A lot of men, especially Arabs, get really challenged because they see what they've been told they can't have or they shouldn't have. It's wrong. They end up with women that their moms will never agree to waste three, four years of their life and hers and then get lost and then maybe go back to what they were.""", help="Transcript of reference audio")
     group = p.add_mutually_exclusive_group(required=False)
     group.add_argument("--target_text", help="Single text to synthesise")
     group.add_argument("--sentences_file", help="Path to txt file with sentences (one per line)")
@@ -274,7 +274,7 @@ def _parse_args():
     # Hidden param used for internal single-synthesis runs
     p.add_argument("--output", help=argparse.SUPPRESS)
     p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--repetition_penalty", type=float, default=1.1)
+    p.add_argument("--repetition_penalty", type=float, default=1.3)
     return p.parse_args()
 
 
