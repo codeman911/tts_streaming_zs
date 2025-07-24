@@ -56,6 +56,19 @@ TOKENS = {
 AUDIO_FRAME_SIZE = 7  # SNAC 24 kHz, 7 codes per 40 ms frame
 
 # -----------------------------------------------------------------------------
+# Default batch sentences
+# -----------------------------------------------------------------------------
+# Used when neither --target_text nor --sentences_file is supplied.
+DEFAULT_SENTENCES = [
+    "Hello, how are you today?",
+    "مرحبا، كيف حالك اليوم؟",
+    "This is a consistency check of zero-shot cloning.",
+    "هذا اختبار للتحقق من تناسق انتحال الصوت.",
+    "Let's see if the voice stays the same across languages.",
+]
+
+
+# -----------------------------------------------------------------------------
 # Helper functions
 # -----------------------------------------------------------------------------
 
@@ -254,8 +267,10 @@ def _parse_args():
     p.add_argument("--model", required=True, help="Path to Orpheus checkpoint")
     p.add_argument("--reference_audio", required=True, help="Reference WAV/FLAC/OGG")
     p.add_argument("--reference_text", required=True, help="Transcript of reference audio")
-    p.add_argument("--target_text", required=True, help="Text to synthesise")
-    p.add_argument("--output", default="output.wav", help="Destination WAV file")
+    group = p.add_mutually_exclusive_group(required=False)
+    group.add_argument("--target_text", help="Single text to synthesise")
+    group.add_argument("--sentences_file", help="Path to txt file with sentences (one per line)")
+    p.add_argument("--output_folder", default="outputs", help="Directory to write WAV files")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--repetition_penalty", type=float, default=1.1)
     return p.parse_args()
@@ -265,17 +280,35 @@ def main():
     args = _parse_args()
     assert os.path.exists(args.reference_audio), "Reference audio not found"
 
-    engine = ZeroShotTTSInference(args.model)
-    engine.generate(
-        reference_audio=args.reference_audio,
-        reference_text=args.reference_text,
-        target_text=args.target_text,
-        output_path=args.output,
-        temperature=args.temperature,
-        repetition_penalty=args.repetition_penalty,
-    )
+    # Determine list of sentences to synthesise
+    if getattr(args, "sentences_file", None):
+        with open(args.sentences_file, "r", encoding="utf-8") as f:
+            targets = [ln.strip() for ln in f.readlines() if ln.strip()]
+    elif getattr(args, "target_text", None):
+        targets = [args.target_text]
+    else:
+        targets = DEFAULT_SENTENCES
+
+    os.makedirs(args.output_folder, exist_ok=True)
+
+    for idx, sentence in enumerate(targets, 1):
+        # Create fresh engine each iteration to avoid async engine shutdown issues
+        engine = ZeroShotTTSInference(args.model)
+
+        safe_name = f"{idx}.wav"
+        out_path = os.path.join(args.output_folder, safe_name)
+        logger.info("Synthesising %d/%d: %s -> %s", idx, len(targets), sentence, out_path)
+        engine.generate(
+            reference_audio=args.reference_audio,
+            reference_text=args.reference_text,
+            target_text=sentence,
+            output_path=out_path,
+            temperature=args.temperature,
+            repetition_penalty=args.repetition_penalty,
+        )
 
 
 if __name__ == "__main__":
     main()
+
 
