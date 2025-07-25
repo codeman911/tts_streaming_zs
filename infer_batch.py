@@ -239,7 +239,7 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
             input_tensor,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.6,
+            temperature=0.3,
             top_p=0.95,
             repetition_penalty=1.1,
             pad_token_id=config.get("pad_token", 128263),
