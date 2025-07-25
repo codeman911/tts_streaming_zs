@@ -225,6 +225,7 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
         + [start_of_human]
         + target_text_ids
         + [end_of_text, end_of_human]
+        + target_text_ids
         + [start_of_ai]
     )
     try:
