@@ -239,9 +239,9 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
             input_tensor,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.7,
+            temperature=0.6,
             top_p=0.95,
-            repetition_penalty=1.3,
+            repetition_penalty=1.1,
             pad_token_id=config.get("pad_token", 128263),
             eos_token_id=end_of_speech
         )
@@ -327,9 +327,6 @@ def main():
     model_path = args.model if args.model else config["model_name"]
     snac_model_path = config.get("snac_model", "hubertsiuzdak/snac_24khz")
 
-    # Load models (TTS and SNAC)
-    load_models(model_path, snac_model_path)
-
     # Load target texts from file if provided
     if len(args.target_texts) == 1 and args.target_texts[0].endswith('.txt'):
         with open(args.target_texts[0], 'r') as f:
@@ -338,8 +335,10 @@ def main():
     # Create output folder if it doesn't exist
     os.makedirs(args.output_folder, exist_ok=True)
 
-    # Generate speech for each target text
+    # Generate speech for each target text, reloading model/SNAC per sentence (state leakage test)
     for i, target_text in enumerate(args.target_texts):
+        logger.info(f"[STATE-LEAK TEST] Reloading model and SNAC for sentence {i+1}/{len(args.target_texts)}")
+        load_models(model_path, snac_model_path)
         output_path = os.path.join(args.output_folder, f"{i:03}.wav")
         success = generate_speech(
             args.reference_audio,
