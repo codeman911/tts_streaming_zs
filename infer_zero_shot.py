@@ -2,7 +2,7 @@
 
 Key points
 -----------
-1. **Prompt template identical to training**  (matches `process_item_zero_shot`):
+1. **Prompt template identical to training** (matches `process_item_zero_shot`):
 
    start_of_human  ref_text  end_of_text end_of_human
    start_of_ai  start_of_speech  ref_audio  end_of_speech end_of_ai
@@ -18,17 +18,15 @@ import argparse
 import logging
 import os
 import time
-import wave
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
-import numpy as np
 import torch
 import torchaudio
 import torchaudio.transforms as T
 from snac import SNAC
 
-from orpheus_tts import OrpheusModel, tokens_decoder_sync
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -58,7 +56,6 @@ AUDIO_FRAME_SIZE = 7  # SNAC 24 kHz, 7 codes per 40 ms frame
 # -----------------------------------------------------------------------------
 # Default batch sentences
 # -----------------------------------------------------------------------------
-# Used when neither --target_text nor --sentences_file is supplied.
 DEFAULT_SENTENCES = [
     "Hello, how are you today?",
     "مرحبا، كيف حالك اليوم؟",
@@ -82,74 +79,60 @@ def _load_audio(path: str | Path, target_sr: int = 24_000) -> torch.Tensor:
     return waveform
 
 
-def _deduplicate_frames(codes: List[int]) -> List[int]:
-    """Remove consecutive duplicate 7-code frames (as in training)."""
-    if not codes or len(codes) < AUDIO_FRAME_SIZE:
-        return []
-    if len(codes) % AUDIO_FRAME_SIZE:
-        # Trim to full frames
-        codes = codes[: -(len(codes) % AUDIO_FRAME_SIZE)]
-    kept: List[int] = codes[:AUDIO_FRAME_SIZE]
-    for i in range(AUDIO_FRAME_SIZE, len(codes), AUDIO_FRAME_SIZE):
-        if codes[i] != kept[-AUDIO_FRAME_SIZE]:
-            kept.extend(codes[i : i + AUDIO_FRAME_SIZE])
-    return kept
-
 # -----------------------------------------------------------------------------
 # Core class
 # -----------------------------------------------------------------------------
 
 class ZeroShotTTSInference:
-    """Lightweight wrapper around Orpheus-TTS for zero-shot cloning."""
+    """Lightweight wrapper for zero-shot cloning, aligned with reference scripts."""
 
     def __init__(self, model_path: str, device: str | None = None):
-        # Auto-detect device if not provided
         if device:
             self.device = device
         else:
             if torch.cuda.is_available():
                 self.device = "cuda"
             elif torch.backends.mps.is_available():
-                # Apple-Silicon Metal backend (PyTorch ≥1.13)
                 self.device = "mps"
             else:
                 self.device = "cpu"
         logger.info("Using device: %s", self.device)
 
-        # Load TTS model (vLLM currently requires GPU; on CPU/MPS we warn but still attempt)
-        try:
-            self.model = OrpheusModel(model_name=model_path)
-        except Exception as exc:
-            if self.device != "cuda":
-                logger.warning(
-                    "OrpheusModel failed to load on %s. GPU is recommended for vLLM-based models.\n"
-                    "Error: %s", self.device, exc
-                )
-                raise
-            raise
+        # Load Model and Tokenizer from HuggingFace
+        self.model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, trust_remote_code=True).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
 
         # SNAC for audio tokenisation
-        self.snac = SNAC.from_pretrained("hubertsiuzdak/snac_24khz")
-        if self.device in ("cuda", "mps"):
-            try:
-                self.snac = self.snac.to(self.device)
-            except Exception:
-                logger.warning("Could not move SNAC to %s; falling back to CPU", self.device)
+        self.snac = SNAC.from_pretrained("hubertsiuzdak/snac_24khz").to(self.device)
+        self.model.eval()
+        self.snac.eval()
 
-    # ------------------------------------------------------------------
-    # Audio tokenisation
-    # ------------------------------------------------------------------
+    def _deduplicate_frames(self, codes_list: List[int]) -> List[int]:
+        """Remove duplicate frames from a list of audio codes."""
+        if not codes_list or len(codes_list) < AUDIO_FRAME_SIZE:
+            return []
+
+        if len(codes_list) % AUDIO_FRAME_SIZE != 0:
+            codes_list = codes_list[:-(len(codes_list) % AUDIO_FRAME_SIZE)]
+
+        if not codes_list:
+            return []
+
+        result = codes_list[:AUDIO_FRAME_SIZE]
+        for i in range(AUDIO_FRAME_SIZE, len(codes_list), AUDIO_FRAME_SIZE):
+            current_frame_start_token = codes_list[i]
+            previous_frame_start_token = result[-AUDIO_FRAME_SIZE]
+
+            if current_frame_start_token != previous_frame_start_token:
+                result.extend(codes_list[i:i+AUDIO_FRAME_SIZE])
+
+        return result
 
     def _tokenise_audio(self, waveform: torch.Tensor) -> List[int]:
-        if waveform.dim() == 2:
-            waveform = waveform.unsqueeze(0)  # (1,1,T)
-        waveform = waveform.to(dtype=torch.float32)
-        if self.device in ("cuda", "mps"):
-            waveform = waveform.to(self.device)
-
+        waveform = waveform.to(self.device, dtype=torch.float32)
         with torch.no_grad():
-            codes = self.snac.encode(waveform)  # tuple/list with 3 tensors
-        # Interleave 7-code frames exactly like training code
+            codes = self.snac.encode(waveform.unsqueeze(0))
+        
         all_codes: List[int] = []
         base = TOKENS["audio_tokens_start"]
         for i in range(codes[0].shape[-1]):
@@ -160,107 +143,104 @@ class ZeroShotTTSInference:
             all_codes.append(codes[1][0, 2 * i + 1].item() + base + 16384)
             all_codes.append(codes[2][0, 4 * i + 2].item() + base + 20480)
             all_codes.append(codes[2][0, 4 * i + 3].item() + base + 24576)
-        return _deduplicate_frames(all_codes)
+        return all_codes
 
-    # ------------------------------------------------------------------
-    # Prompt builder (matches training)
-    # ------------------------------------------------------------------
+    def _decode_audio(self, audio_tokens: List[int]) -> Optional[torch.Tensor]:
+        if not audio_tokens or len(audio_tokens) < AUDIO_FRAME_SIZE:
+            return None
 
-    def _build_prompt(
-        self,
-        ref_text: str,
-        ref_audio_codes: List[int],
-        target_text: str,
-    ) -> str:
-        tok = self.model.tokeniser
-        ref_text_ids = tok(ref_text, return_tensors="pt").input_ids[0]
-        tgt_text_ids = tok(target_text, return_tensors="pt").input_ids[0]
+        if len(audio_tokens) % AUDIO_FRAME_SIZE != 0:
+            audio_tokens = audio_tokens[:-(len(audio_tokens) % AUDIO_FRAME_SIZE)]
 
-        # tensors for special tokens
-        sohu = torch.tensor([TOKENS["start_of_human"]], dtype=torch.int64)
-        eohu = torch.tensor([TOKENS["end_of_human"]], dtype=torch.int64)
-        soai = torch.tensor([TOKENS["start_of_ai"]], dtype=torch.int64)
-        sos = torch.tensor([TOKENS["start_of_speech"]], dtype=torch.int64)
-        eospeech = torch.tensor([TOKENS["end_of_speech"]], dtype=torch.int64)
-        eoai = torch.tensor([TOKENS["end_of_ai"]], dtype=torch.int64)
-        eot = torch.tensor([TOKENS["end_of_text"]], dtype=torch.int64)
-        ref_audio_ids = torch.tensor(ref_audio_codes, dtype=torch.int64)
+        level_0, level_1, level_2 = [], [], []
+        base = TOKENS["audio_tokens_start"]
+        for i in range(0, len(audio_tokens), AUDIO_FRAME_SIZE):
+            level_0.append(audio_tokens[i] - base)
+            level_1.extend([audio_tokens[i+1] - (base + 4096), audio_tokens[i+4] - (base + 16384)])
+            level_2.extend([audio_tokens[i+2] - (base + 8192), audio_tokens[i+3] - (base + 12288), audio_tokens[i+5] - (base + 20480), audio_tokens[i+6] - (base + 24576)])
 
-        prompt_ids = torch.cat(
-            [
-                # Human turn with reference text (REQUIRED for proper zero-shot inference)
-                sohu,
-                ref_text_ids,
-                eot,
-                eohu,
-                # AI turn with reference audio
-                soai,
-                sos,
-                ref_audio_ids,
-                eospeech,
-                eoai,
-                # Human turn with target text
-                sohu,
-                tgt_text_ids,
-                eot,
-                eohu,
-                # AI begins generation
-                soai,
-                sos,  # <-- generation starts after this
-            ],
-            dim=0,
+        t_level_0 = torch.tensor(level_0, dtype=torch.long, device=self.device).unsqueeze(0)
+        t_level_1 = torch.tensor(level_1, dtype=torch.long, device=self.device).unsqueeze(0)
+        t_level_2 = torch.tensor(level_2, dtype=torch.long, device=self.device).unsqueeze(0)
+
+        with torch.no_grad():
+            waveform = self.snac.decode([t_level_0, t_level_1, t_level_2])
+            return waveform.squeeze(0).cpu()
+
+    def _build_prompt_ids(self, ref_text: str, ref_audio_codes: List[int], target_text: str) -> torch.Tensor:
+        ref_text_ids = self.tokenizer.encode(ref_text, add_special_tokens=False)
+        tgt_text_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+
+        prompt_ids = (
+            [TOKENS["start_of_human"]] + ref_text_ids + [TOKENS["end_of_text"], TOKENS["end_of_human"]]
+            + [TOKENS["start_of_ai"], TOKENS["start_of_speech"]] + ref_audio_codes + [TOKENS["end_of_speech"], TOKENS["end_of_ai"]]
+            + [TOKENS["start_of_human"]] + tgt_text_ids + [TOKENS["end_of_text"], TOKENS["end_of_human"]]
+            + [TOKENS["start_of_ai"], TOKENS["start_of_speech"]]
         )
-        prompt = tok.decode(prompt_ids, skip_special_tokens=False)
-        # remove <s> if tokenizer adds it
-        return prompt.replace("<s>", "")
-
-    # ------------------------------------------------------------------
-    # Public generate API
-    # ------------------------------------------------------------------
+        return torch.tensor(prompt_ids, dtype=torch.long, device=self.device)
 
     def generate(
-        self,
-        reference_audio: str,
-        reference_text: str,
-        target_text: str,
-        output_path: str = "output.wav",
-        temperature: float = 0.7,
-        repetition_penalty: float = 1.1,
+        self, reference_audio: str, reference_text: str, target_text: str,
+        output_path: str = "output.wav", temperature: float = 0.3,
+        top_p: float = 0.95, repetition_penalty: float = 1.1,
     ) -> str:
-        # Build prompt
         waveform = _load_audio(reference_audio)
         audio_codes = self._tokenise_audio(waveform)
-        prompt = self._build_prompt(reference_text, audio_codes, target_text)
+        audio_codes = self._deduplicate_frames(audio_codes)
+        if not audio_codes:
+            logger.error("Reference audio tokenization failed or resulted in no valid frames.")
+            return ""
+
+        prompt_ids = self._build_prompt_ids(reference_text, audio_codes, target_text)
+        input_tensor = prompt_ids.unsqueeze(0)
 
         logger.info("Generating speech…")
         start = time.monotonic()
 
-        # Generate tokens stream from the model
-        token_gen = self.model.generate_tokens_sync(
-            prompt=prompt,
-            temperature=temperature,
-            top_p=0.95,
-            repetition_penalty=repetition_penalty,
-            stop_token_ids=[TOKENS["end_of_speech"], TOKENS["end_of_ai"]],
-            max_tokens=4096,
-        )
+        # This function forces the model to start generation with the start_of_speech token.
+        def prefix_allowed_tokens_fn(batch_id, sent):
+            return [TOKENS["start_of_speech"]]
 
-        # Decode tokens → audio chunks
-        audio_chunks = tokens_decoder_sync(token_gen)
+        with torch.inference_mode():
+            output_ids = self.model.generate(
+                input_tensor,
+                max_new_tokens=4096, do_sample=True, temperature=temperature,
+                top_p=top_p, repetition_penalty=repetition_penalty,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=TOKENS["end_of_speech"],
+                prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
+            )
+        
+        generated_ids = output_ids[0][len(prompt_ids):].tolist()
 
-        # Write wav incrementally
+        audio_tokens = []
+        try:
+            first_audio_tok_idx = generated_ids.index(TOKENS["start_of_speech"])
+            generated_ids = generated_ids[first_audio_tok_idx+1:]
+        except ValueError:
+            logger.warning("Could not find start_of_speech token in generated output. Using all generated tokens.")
+
+        for token_id in generated_ids:
+            if token_id == TOKENS["end_of_speech"]:
+                break
+            audio_tokens.append(token_id)
+
+        if not audio_tokens:
+            logger.error("No audio tokens were generated.")
+            return ""
+
+        output_waveform = self._decode_audio(audio_tokens)
+        if output_waveform is None:
+            logger.error("Failed to decode audio tokens into waveform.")
+            return ""
+
         os.makedirs(os.path.dirname(os.path.abspath(output_path)) or ".", exist_ok=True)
-        with wave.open(output_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)  # 16-bit
-            wf.setframerate(24_000)
-            for chunk in audio_chunks:
-                if chunk:
-                    wf.writeframes(chunk)
+        torchaudio.save(output_path, output_waveform, 24000)
 
         dur = time.monotonic() - start
         logger.info("Saved %s (%.2f s)", output_path, dur)
         return output_path
+
 
 # -----------------------------------------------------------------------------
 # CLI
@@ -275,20 +255,19 @@ def _parse_args():
     group.add_argument("--target_text", help="Single text to synthesise")
     group.add_argument("--sentences_file", help="Path to txt file with sentences (one per line)")
     p.add_argument("--output_folder", default="outputs", help="Directory to write WAV files")
-    # Hidden param used for internal single-synthesis runs
     p.add_argument("--output", help=argparse.SUPPRESS)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--repetition_penalty", type=float, default=1.3)
+    p.add_argument("--temperature", type=float, default=0.3)
+    p.add_argument("--top_p", type=float, default=0.95)
+    p.add_argument("--repetition_penalty", type=float, default=1.1)
     return p.parse_args()
 
 
 def main():
-    import subprocess, sys, shlex
-
     args = _parse_args()
     assert os.path.exists(args.reference_audio), "Reference audio not found"
 
-    # Determine list of sentences to synthesise
+    inference_engine = ZeroShotTTSInference(args.model)
+
     if getattr(args, "sentences_file", None):
         with open(args.sentences_file, "r", encoding="utf-8") as f:
             targets = [ln.strip() for ln in f.readlines() if ln.strip()]
@@ -297,23 +276,26 @@ def main():
     else:
         targets = DEFAULT_SENTENCES
 
-    # If --output was supplied we perform a single synthesis and exit
-    if getattr(args, "output", None):
-        engine = ZeroShotTTSInference(args.model)
-        engine.generate(
-            reference_audio=args.reference_audio,
-            reference_text=args.reference_text,
-            target_text=args.target_text,
-            output_path=args.output,
-            temperature=args.temperature,
-            repetition_penalty=args.repetition_penalty,
-        )
-        return
-
-    # Batch mode – spawn a fresh python process for each sentence to avoid engine shutdown
     os.makedirs(args.output_folder, exist_ok=True)
 
-    script_path = os.path.abspath(__file__)
+    for i, text in enumerate(targets):
+        # Use a consistent naming scheme for output files
+        output_filename = f"{i:03d}_{text[:20].replace(' ', '_')}.wav"
+        if args.output and len(targets) == 1:
+             # If a specific output file is requested for a single target, use it
+            output_filename = args.output
+
+        output_path = os.path.join(args.output_folder, output_filename)
+        logger.info("--- Generating for: '%s' ---", text)
+        inference_engine.generate(
+            reference_audio=args.reference_audio,
+            reference_text=args.reference_text,
+            target_text=text,
+            output_path=output_path,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            repetition_penalty=args.repetition_penalty,
+        )
 
     for idx, sentence in enumerate(targets, 1):
         safe_name = f"{idx}.wav"
