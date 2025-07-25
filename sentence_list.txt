@@ -1,5 +1,10 @@
-"اليوم رحنا السوق الشعبي مع الأهل واشترينا أشياء كثيرة حق البيت، وكان الجو وايد حلو.",
-"أنا وايد أحب أتمشى على الكورنيش في أبوظبي خصوصاً وقت الغروب، المنظر يكون روعة والجو هادي.",
-"أحب أشرب القهوة العربية مع التمر في الصبح قبل ما أروح الدوام، تعطي طاقة ليوم كامل.",
-"I enjoy going to the desert with my friends; we light a fire and chat until dawn, the atmosphere there is different and very relaxing.",
-"Yesterday we had a big gathering at home; everyone brought different food and the evening was a lot of fun."
+    "يا ربي، شفت اليوم sunset على البحر. وكان المنظر absolutely amazing!",
+    "Honestly, الجو في أبوظبي اليوم مرّة جميل. Everything feels so peaceful.",
+    "أحب أروح ال-café الصبح. أطلب لي قهوة وأجلس أقرأ شوي before the day starts.",
+    "Sometimes, كل ما أسمع الأغاني القديمة on the radio. ترجع لي ذكريات جميلة جداً.",
+    "Just imagine، لو نحصل يوم إجازة بدون أي موبايلات. كيف بيكون الإحساس؟",
+    "كل واحد فينا يحلم big dreams. بس لازم نسوي plan ونشتغل عليه.",
+    "الفطور اليوم كان pancakes وعسل. You should’ve seen how happy I was!",
+    "I can’t believe كيف الوقت مرّ بسرعة. أمس كان الاثنين والآن almost weekend!",
+    "كل ما أسمع كلمة ‘family’. أحس بدفء في قلبي, especially لما نكون مجتمعين together.",
+    "الحياة momentsها beautiful. لازم نستمتع بكل ثانية—even the small details."

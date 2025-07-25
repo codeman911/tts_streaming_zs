@@ -239,9 +239,9 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
             input_tensor,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.3,
+            temperature=0.7,
             top_p=0.95,
-            repetition_penalty=1.1,
+            repetition_penalty=1.3,
             pad_token_id=config.get("pad_token", 128263),
             eos_token_id=end_of_speech
         )
