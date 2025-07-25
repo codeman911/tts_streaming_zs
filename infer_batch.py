@@ -174,22 +174,18 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
     """Generate speech using zero-shot voice cloning"""
     global model, tokenizer, config, snac_model
     
-    # --- CRITICAL: Define audio_tokens_start for all downstream calls ---
     audio_tokens_start = 128266
 
-    # Set deterministic random seeds for reproducibility
     import random
     torch.manual_seed(42)
     np.random.seed(42)
     random.seed(42)
 
-    # Load reference audio and process SNAC codes as before
     logger.info(f"Loading reference audio from {reference_audio_path}")
     waveform, sample_rate = torchaudio.load(reference_audio_path)
-    if waveform.shape[0] > 1:  # Convert stereo to mono
+    if waveform.shape[0] > 1:
         waveform = torch.mean(waveform, dim=0, keepdim=True)
-    
-    # Get SNAC codes for reference audio
+
     logger.info("Tokenizing reference audio")
     reference_audio_tokens = tokenise_audio(waveform, sample_rate, audio_tokens_start=audio_tokens_start)
     if reference_audio_tokens is None or len(reference_audio_tokens) < 7:
@@ -199,14 +195,11 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
     if reference_audio_tokens is None or len(reference_audio_tokens) < 7:
         logger.error("Reference audio tokens are invalid after removing duplicates")
         return False
-    # Debug: Log first 30 SNAC tokens
     logger.info(f"[DEBUG] First 30 SNAC tokens from reference audio: {reference_audio_tokens[:30]}")
-    
-    # Get vocabulary size
+
     vocab_size = tokenizer.vocab_size
     logger.info(f"Model vocabulary size: {vocab_size}")
-    
-    # Create token IDs from config
+
     start_of_human = config.get("start_of_human", 128259)
     end_of_human = config.get("end_of_human", 128260)
     start_of_ai = config.get("start_of_ai", 128261)
@@ -214,49 +207,44 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
     end_of_speech = config.get("end_of_speech", 128258)
     end_of_ai = config.get("end_of_ai", 128262)
     end_of_text = config.get("end_of_text", 128009)
-    
-    # Encode texts directly without validation
+
     logger.info(f"Encoding reference text: {reference_text[:50]}...")
     reference_text_ids = tokenizer.encode(reference_text, add_special_tokens=True)
-    
     logger.info(f"Encoding target text: {target_text[:50]}...")
     target_text_ids = tokenizer.encode(target_text, add_special_tokens=True)
-    
-    # Build prompt: Human(ref_text)->AI(ref_audio)->Human(target_text)->AI(generation)
-    prompt = (
+
+    input_ids = (
         [start_of_human]
         + reference_text_ids
         + [end_of_text, end_of_human]
         + [start_of_ai]
         + [start_of_speech]
         + reference_audio_tokens
-        + [end_of_speech, end_of_ai]
+        + [end_of_speech]
+        + [end_of_ai]
         + [start_of_human]
         + target_text_ids
         + [end_of_text, end_of_human]
         + [start_of_ai]
     )
-    # Debug: Log prompt string and first 50 prompt tokens
     try:
-        prompt_text = tokenizer.decode([t for t in prompt if t < 128000])  # Only decode text tokens
+        prompt_text = tokenizer.decode([t for t in input_ids if t < 128000])
         logger.info(f"[DEBUG] Prompt string (text tokens only): {prompt_text}")
     except Exception as e:
         logger.warning(f"[DEBUG] Could not decode prompt text: {e}")
-    logger.info(f"[DEBUG] First 50 prompt tokens: {prompt[:50]}")
+    logger.info(f"[DEBUG] First 50 prompt tokens: {input_ids[:50]}")
 
-    # Set random seeds for each batch item
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # Generate with correct parameters
-    input_tensor = torch.tensor([prompt], device=model.device)
+    input_tensor = torch.tensor([input_ids], device=model.device)
     logger.info("Generating speech...")
     with torch.inference_mode():
         output = model.generate(
             input_tensor,
             max_new_tokens=max_new_tokens,
             do_sample=True,
-            temperature=0.6,
+            temperature=0.3,
             top_p=0.95,
             repetition_penalty=1.1,
             pad_token_id=config.get("pad_token", 128263),
@@ -264,20 +252,16 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
         )
         logger.info(f"Raw model output shape: {output.shape}")
         logger.info(f"Raw model output first 50 tokens: {output[0][:50].tolist()}")
-    
-        # Extract generated tokens (only the new ones)
-        generated_tokens = output[0][len(prompt):].tolist()
+        generated_tokens = output[0][len(input_ids):].tolist()
         logger.info(f"Number of generated tokens: {len(generated_tokens)}")
         logger.info(f"First 50 generated tokens: {generated_tokens[:50]}")
         try:
             logger.info(f"Generated text: {tokenizer.decode(generated_tokens[:50])}...")
         except Exception as e:
             logger.error(f"Error decoding generated tokens: {e}")
-    
-    # Find audio tokens in the generated output
+
     audio_tokens = []
     in_speech = False
-    
     for token in generated_tokens:
         if token == start_of_speech:
             in_speech = True
@@ -285,28 +269,21 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
         elif token == end_of_speech:
             in_speech = False
             break
-        
-        if in_speech and token >= audio_tokens_start:  
+        if in_speech and token >= audio_tokens_start:
             audio_tokens.append(token)
-    
+
     if not audio_tokens:
         logger.error("No audio tokens generated")
         return False
-    
-    # Decode audio tokens to waveform
+
     logger.info("Decoding audio tokens to waveform")
     output_waveform = decode_audio_tokens(audio_tokens, audio_tokens_start=audio_tokens_start)
-    
     if output_waveform is None:
         logger.error("Failed to decode audio tokens")
         return False
-    
-    # Ensure output_waveform is 2D [channels, samples]
     if output_waveform.dim() != 2:
         logger.info(f"Reshaping output waveform from shape {output_waveform.shape}")
         output_waveform = output_waveform.view(1, -1)
-    
-    # Save output audio
     logger.info(f"Saving output audio to {output_path}")
     try:
         torchaudio.save(
@@ -319,7 +296,6 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
     except Exception as e:
         logger.error(f"Error saving audio: {e}")
         return False
-    
     return True
 
 
@@ -374,6 +350,14 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
+
+
 
 
 
