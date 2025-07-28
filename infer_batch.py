@@ -40,6 +40,19 @@ def load_models(model_path, snac_model_path):
         use_fast=True,
         legacy=True  # Important for maintaining original tokenizer behavior
     )
+
+    # Explicitly set pad_token to prevent automatic vocabulary resizing.
+    # Use the pad_token id defined in config if it exists *and* is already
+    # inside the checkpoint's vocabulary. Otherwise, safely fall back to
+    # the existing EOS token (which always exists) so no resize happens.
+    pad_token_id_cfg = config.get("pad_token")
+    if pad_token_id_cfg is not None and pad_token_id_cfg < tokenizer.vocab_size:
+        tokenizer.pad_token_id = pad_token_id_cfg
+        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(pad_token_id_cfg)
+    else:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        tokenizer.pad_token = tokenizer.eos_token
+    logger.info(f"Using pad_token_id={tokenizer.pad_token_id}")
     
     logger.info(f"Loading model from {model_path}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -48,6 +61,8 @@ def load_models(model_path, snac_model_path):
         torch_dtype=torch.bfloat16,
         trust_remote_code=True  # Allow model to use its original configuration
     )
+    # Ensure model config is aware of pad token
+    model.config.pad_token_id = tokenizer.pad_token_id
     
     # Move model to GPU
     model = model.to("cuda:0")
@@ -170,7 +185,7 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
     
     return waveform.cpu()
 
-def generate_speech(reference_audio_path, reference_text, target_text, output_path, max_new_tokens=2000):
+def generate_speech(reference_audio_path, reference_text, target_text, output_path, max_new_tokens=8192):
     """Generate speech using zero-shot voice cloning"""
     global model, tokenizer, config, snac_model
     
@@ -351,17 +366,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
