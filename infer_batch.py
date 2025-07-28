@@ -35,7 +35,7 @@ def load_models(model_path, snac_model_path):
     # Load tokenizer without vocabulary restrictions
     tokenizer = AutoTokenizer.from_pretrained(
         model_path,
-        model_max_length=2048,
+        model_max_length=8192,
         padding_side="left",
         use_fast=True,
         legacy=True  # Important for maintaining original tokenizer behavior
