@@ -104,91 +104,68 @@ def tokenise_audio(waveform, sample_rate=24000):
         logger.error(f"Error in tokenise_audio: {str(e)}")
         return None
 
-def redistribute_codes(code_list):
-    """Redistribute codes back to SNAC format (Orpheus style)"""
+def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
+    """Decode SNAC tokens back to audio waveform (EXACT copy from working inference.py)"""
     global snac_model
     
-    layer_1 = []
-    layer_2 = []
-    layer_3 = []
-    
-    # SNAC token bounds (typical range is 0-4095 for each layer)
-    max_token_value = 4095
-    
-    for i in range((len(code_list)+1)//7):
-        if 7*i+6 < len(code_list):  # Ensure we have a complete frame
-            # Extract and validate tokens
-            l1_token = code_list[7*i]
-            l2_token_1 = code_list[7*i+1] - 4096
-            l3_token_1 = code_list[7*i+2] - (2*4096)
-            l3_token_2 = code_list[7*i+3] - (3*4096)
-            l2_token_2 = code_list[7*i+4] - (4*4096)
-            l3_token_3 = code_list[7*i+5] - (5*4096)
-            l3_token_4 = code_list[7*i+6] - (6*4096)
-            
-            # Validate token ranges
-            tokens_to_check = [
-                (l1_token, "layer_1"),
-                (l2_token_1, "layer_2_1"), 
-                (l3_token_1, "layer_3_1"),
-                (l3_token_2, "layer_3_2"),
-                (l2_token_2, "layer_2_2"),
-                (l3_token_3, "layer_3_3"),
-                (l3_token_4, "layer_3_4")
-            ]
-            
-            valid_frame = True
-            for token, name in tokens_to_check:
-                if token < 0 or token > max_token_value:
-                    logger.warning(f"Invalid token in {name}: {token} (should be 0-{max_token_value})")
-                    valid_frame = False
-                    break
-            
-            if valid_frame:
-                layer_1.append(l1_token)
-                layer_2.append(l2_token_1)
-                layer_3.append(l3_token_1)
-                layer_3.append(l3_token_2)
-                layer_2.append(l2_token_2)
-                layer_3.append(l3_token_3)
-                layer_3.append(l3_token_4)
-            else:
-                logger.warning(f"Skipping invalid frame {i}")
-    
-    if not layer_1:  # No valid frames
-        logger.error("No valid audio frames found")
+    if not audio_tokens or len(audio_tokens) < 7:
+        logger.error("Not enough audio tokens to decode")
         return None
     
-    # Ensure layer lengths are consistent
-    expected_l2_len = len(layer_1) * 2
-    expected_l3_len = len(layer_1) * 4
+    # Ensure we have a multiple of 7 tokens
+    if len(audio_tokens) % 7 != 0:
+        audio_tokens = audio_tokens[:-(len(audio_tokens) % 7)]
     
-    if len(layer_2) != expected_l2_len or len(layer_3) != expected_l3_len:
-        logger.error(f"Layer length mismatch: L1={len(layer_1)}, L2={len(layer_2)} (expected {expected_l2_len}), L3={len(layer_3)} (expected {expected_l3_len})")
-        return None
-        
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Prepare arrays for each level
+    level_0_tokens = []
+    level_1_tokens = []
+    level_2_tokens = []
     
-    try:
-        codes = [
-            torch.tensor(layer_1, dtype=torch.long).unsqueeze(0).to(device),
-            torch.tensor(layer_2, dtype=torch.long).unsqueeze(0).to(device),
-            torch.tensor(layer_3, dtype=torch.long).unsqueeze(0).to(device)
-        ]
+    # Extract tokens for each level with SNAC bounds validation
+    for i in range(0, len(audio_tokens), 7):
+        # Level 0 token
+        l0_token = audio_tokens[i] - audio_tokens_start
+        l0_token = max(0, min(4095, l0_token))  # Clamp to SNAC range
+        level_0_tokens.append(l0_token)
         
-        logger.info(f"SNAC decode input shapes: L1={codes[0].shape}, L2={codes[1].shape}, L3={codes[2].shape}")
+        # Level 1 tokens
+        l1_token_1 = audio_tokens[i+1] - (audio_tokens_start + 4096)
+        l1_token_1 = max(0, min(4095, l1_token_1))  # Clamp to SNAC range
+        l1_token_2 = audio_tokens[i+4] - (audio_tokens_start + 4*4096)
+        l1_token_2 = max(0, min(4095, l1_token_2))  # Clamp to SNAC range
+        level_1_tokens.extend([l1_token_1, l1_token_2])
         
-        with torch.inference_mode():
-            audio_hat = snac_model.decode(codes)
-        
-        return audio_hat
-        
-    except Exception as e:
-        logger.error(f"SNAC decode failed: {str(e)}")
-        logger.error(f"Layer 1 range: {min(layer_1) if layer_1 else 'N/A'} - {max(layer_1) if layer_1 else 'N/A'}")
-        logger.error(f"Layer 2 range: {min(layer_2) if layer_2 else 'N/A'} - {max(layer_2) if layer_2 else 'N/A'}")
-        logger.error(f"Layer 3 range: {min(layer_3) if layer_3 else 'N/A'} - {max(layer_3) if layer_3 else 'N/A'}")
-        return None
+        # Level 2 tokens
+        l2_token_1 = audio_tokens[i+2] - (audio_tokens_start + 2*4096)
+        l2_token_1 = max(0, min(4095, l2_token_1))  # Clamp to SNAC range
+        l2_token_2 = audio_tokens[i+3] - (audio_tokens_start + 3*4096)
+        l2_token_2 = max(0, min(4095, l2_token_2))  # Clamp to SNAC range
+        l2_token_3 = audio_tokens[i+5] - (audio_tokens_start + 5*4096)
+        l2_token_3 = max(0, min(4095, l2_token_3))  # Clamp to SNAC range
+        l2_token_4 = audio_tokens[i+6] - (audio_tokens_start + 6*4096)
+        l2_token_4 = max(0, min(4095, l2_token_4))  # Clamp to SNAC range
+        level_2_tokens.extend([l2_token_1, l2_token_2, l2_token_3, l2_token_4])
+    
+    # Convert to tensors
+    level_0 = torch.tensor(level_0_tokens, dtype=torch.long).unsqueeze(0).to("cuda:0")
+    level_1 = torch.tensor(level_1_tokens, dtype=torch.long).unsqueeze(0).to("cuda:0")
+    level_2 = torch.tensor(level_2_tokens, dtype=torch.long).unsqueeze(0).to("cuda:0")
+    
+    logger.info(f"SNAC decode shapes: L0={level_0.shape}, L1={level_1.shape}, L2={level_2.shape}")
+    logger.info(f"Level 0 range: {min(level_0_tokens)} - {max(level_0_tokens)}")
+    logger.info(f"Level 1 range: {min(level_1_tokens)} - {max(level_1_tokens)}")
+    logger.info(f"Level 2 range: {min(level_2_tokens)} - {max(level_2_tokens)}")
+    
+    # Decode using SNAC model
+    with torch.inference_mode():
+        waveform = snac_model.decode([level_0, level_1, level_2])
+        # Ensure waveform is 2D [channels, samples]
+        if waveform.dim() == 1:
+            waveform = waveform.unsqueeze(0)
+        elif waveform.dim() == 3:
+            waveform = waveform.squeeze(0)
+    
+    return waveform.cpu()
 
 def generate_speech_orpheus_style(reference_audio_path, reference_text, target_texts, max_new_tokens=990):
     """Generate speech using Orpheus-style batching"""
@@ -234,12 +211,13 @@ def generate_speech_orpheus_style(reference_audio_path, reference_text, target_t
         logger.info(f"Encoding target text: {target_text[:50]}...")
         target_input_ids = tokenizer(target_text, return_tensors="pt").input_ids
         
-        # Create complete prompt for this target
+        # Create complete prompt for this target (matching working inference.py)
         second_input_ids = torch.cat([
             zeroprompt_input_ids,
             start_tokens,  # start_of_human
             target_input_ids,
-            torch.tensor([[128009, 128260]], dtype=torch.int64)  # end_of_text, end_of_human
+            torch.tensor([[128009, 128260]], dtype=torch.int64),  # end_of_text, end_of_human
+            torch.tensor([[128261]], dtype=torch.int64)  # start_of_ai (CRUCIAL!)
         ], dim=1)
         
         all_modified_input_ids.append(second_input_ids)
@@ -316,19 +294,42 @@ def generate_speech_orpheus_style(reference_audio_path, reference_text, target_t
             new_length = (row_length // 7) * 7
             trimmed_tokens = masked_tokens[:new_length]
             
-            # Convert to audio token range
-            audio_codes = [t.item() - 128266 for t in trimmed_tokens]
+            # Convert to audio token range (matching working inference.py)
+            audio_codes = []
+            for t in trimmed_tokens:
+                # Convert tensor element to Python int (NO offset subtraction here)
+                token_val = t.item()
+                # Validate token is in reasonable range for raw tokens
+                if 128266 <= token_val <= 200000:  # Raw token range
+                    audio_codes.append(token_val)
+                else:
+                    logger.warning(f"Skipping out-of-range audio token: {token_val}")
             
-            if len(audio_codes) >= 7:  # At least one complete frame
+            # Ensure we still have multiple of 7 after filtering
+            if len(audio_codes) >= 7:
+                # Trim to multiple of 7 again after filtering
+                final_length = (len(audio_codes) // 7) * 7
+                audio_codes = audio_codes[:final_length]
+                
                 logger.info(f"Decoding {len(audio_codes)} audio tokens to waveform")
-                waveform = redistribute_codes(audio_codes)
+                logger.info(f"Audio token range: {min(audio_codes)} - {max(audio_codes)}")
+                
+                waveform = decode_audio_tokens(audio_codes)
                 if waveform is not None:
-                    results.append(waveform.detach().squeeze().cpu())
+                    # Handle Trelis-style output (ensure proper tensor format)
+                    if hasattr(waveform, 'detach'):
+                        waveform = waveform.detach().squeeze().cpu()
+                    
+                    # Ensure waveform is 1D for torchaudio.save
+                    if waveform.dim() > 1:
+                        waveform = waveform.squeeze()
+                    
+                    results.append(waveform)
                 else:
                     logger.error(f"Failed to decode audio for sequence {i+1}")
                     results.append(None)
             else:
-                logger.error(f"Not enough audio tokens for sequence {i+1}")
+                logger.error(f"Not enough valid audio tokens for sequence {i+1} (got {len(audio_codes)}, need at least 7)")
                 results.append(None)
         else:
             logger.error(f"No audio tokens found for sequence {i+1}")
