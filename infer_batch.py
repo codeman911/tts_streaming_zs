@@ -40,19 +40,6 @@ def load_models(model_path, snac_model_path):
         use_fast=True,
         legacy=True  # Important for maintaining original tokenizer behavior
     )
-
-    # Explicitly set pad_token to prevent automatic vocabulary resizing.
-    # Use the pad_token id defined in config if it exists *and* is already
-    # inside the checkpoint's vocabulary. Otherwise, safely fall back to
-    # the existing EOS token (which always exists) so no resize happens.
-    pad_token_id_cfg = config.get("pad_token")
-    if pad_token_id_cfg is not None and pad_token_id_cfg < tokenizer.vocab_size:
-        tokenizer.pad_token_id = pad_token_id_cfg
-        tokenizer.pad_token = tokenizer.convert_ids_to_tokens(pad_token_id_cfg)
-    else:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
-        tokenizer.pad_token = tokenizer.eos_token
-    logger.info(f"Using pad_token_id={tokenizer.pad_token_id}")
     
     logger.info(f"Loading model from {model_path}")
     model = AutoModelForCausalLM.from_pretrained(
@@ -61,8 +48,6 @@ def load_models(model_path, snac_model_path):
         torch_dtype=torch.bfloat16,
         trust_remote_code=True  # Allow model to use its original configuration
     )
-    # Ensure model config is aware of pad token
-    model.config.pad_token_id = tokenizer.pad_token_id
     
     # Move model to GPU
     model = model.to("cuda:0")
@@ -240,7 +225,6 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
         + [start_of_human]
         + target_text_ids
         + [end_of_text, end_of_human]
-        + target_text_ids
         + [start_of_ai]
     )
     try:
@@ -344,25 +328,158 @@ def main():
     # Create output folder if it doesn't exist
     os.makedirs(args.output_folder, exist_ok=True)
 
-    # Generate speech for each target text, reloading model/SNAC per sentence (state leakage test)
-    for i, target_text in enumerate(args.target_texts):
-        logger.info(f"[STATE-LEAK TEST] Reloading model and SNAC for sentence {i+1}/{len(args.target_texts)}")
-        load_models(model_path, snac_model_path)
-        output_path = os.path.join(args.output_folder, f"{i:03}.wav")
-        success = generate_speech(
-            args.reference_audio,
-            args.reference_text,
-            target_text,
-            output_path,
-            args.max_new_tokens
-        )
-        
-        if success:
-            logger.info(f"Speech generation completed successfully for {target_text[:50]}...")
-        else:
-            logger.error(f"Speech generation failed for {target_text[:50]}...")
+    # Load models ONCE at the beginning
+    logger.info("Loading models for batch processing...")
+    load_models(model_path, snac_model_path)
     
-    logger.info("All speech generations completed")
+    # Process reference audio once
+    logger.info(f"Loading reference audio from {args.reference_audio}")
+    waveform, sample_rate = torchaudio.load(args.reference_audio)
+    if waveform.shape[0] > 1:
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
 
+    logger.info("Tokenizing reference audio")
+    reference_audio_tokens = tokenise_audio(waveform, sample_rate, audio_tokens_start=128266)
+    if reference_audio_tokens is None or len(reference_audio_tokens) < 7:
+        logger.error("Failed to tokenize reference audio")
+        return
+    reference_audio_tokens = remove_duplicate_frames(reference_audio_tokens)
+    if reference_audio_tokens is None or len(reference_audio_tokens) < 7:
+        logger.error("Reference audio tokens are invalid after removing duplicates")
+        return
+
+    # Prepare batch prompts
+    logger.info("Preparing batch prompts...")
+    all_input_ids = []
+    
+    # Get special tokens
+    start_of_human = config.get("start_of_human", 128259)
+    end_of_human = config.get("end_of_human", 128260)
+    start_of_ai = config.get("start_of_ai", 128261)
+    start_of_speech = config.get("start_of_speech", 128257)
+    end_of_speech = config.get("end_of_speech", 128258)
+    end_of_ai = config.get("end_of_ai", 128262)
+    end_of_text = config.get("end_of_text", 128009)
+    
+    # Encode reference text once
+    reference_text_ids = tokenizer.encode(args.reference_text, add_special_tokens=True)
+    
+    # Create base prompt (reference part)
+    base_prompt = (
+        [start_of_human]
+        + reference_text_ids
+        + [end_of_text, end_of_human]
+        + [start_of_ai]
+        + [start_of_speech]
+        + reference_audio_tokens
+        + [end_of_speech]
+        + [end_of_ai]
+    )
+    
+    # Create prompts for each target text
+    for target_text in args.target_texts:
+        target_text_ids = tokenizer.encode(target_text, add_special_tokens=True)
+        input_ids = (
+            base_prompt
+            + [start_of_human]
+            + target_text_ids
+            + [end_of_text, end_of_human]
+            + [start_of_ai]
+        )
+        all_input_ids.append(torch.tensor(input_ids))
+    
+    # Pad sequences to same length for batching
+    max_length = max(len(ids) for ids in all_input_ids)
+    pad_token_id = config.get("pad_token", 128263)
+    
+    padded_input_ids = []
+    attention_masks = []
+    
+    for input_ids in all_input_ids:
+        padding_length = max_length - len(input_ids)
+        # Left pad with pad tokens
+        padded_ids = torch.cat([
+            torch.full((padding_length,), pad_token_id, dtype=torch.long),
+            input_ids
+        ])
+        # Create attention mask (0 for padding, 1 for real tokens)
+        attention_mask = torch.cat([
+            torch.zeros(padding_length, dtype=torch.long),
+            torch.ones(len(input_ids), dtype=torch.long)
+        ])
+        
+        padded_input_ids.append(padded_ids)
+        attention_masks.append(attention_mask)
+    
+    # Convert to batch tensors
+    batch_input_ids = torch.stack(padded_input_ids).to(model.device)
+    batch_attention_masks = torch.stack(attention_masks).to(model.device)
+    
+    logger.info(f"Generating speech for {len(args.target_texts)} sentences in batch...")
+    
+    # Generate in batch
+    with torch.inference_mode():
+        output = model.generate(
+            input_ids=batch_input_ids,
+            attention_mask=batch_attention_masks,
+            max_new_tokens=args.max_new_tokens,
+            do_sample=True,
+            temperature=0.3,
+            top_p=0.95,
+            repetition_penalty=1.1,
+            pad_token_id=pad_token_id,
+            eos_token_id=end_of_speech,
+            num_return_sequences=1
+        )
+    
+    # Process each generated sequence
+    for i, (generated_sequence, original_length) in enumerate(zip(output, [len(ids) for ids in all_input_ids])):
+        # Extract only the newly generated tokens
+        generated_tokens = generated_sequence[max_length:].tolist()
+        
+        # Extract audio tokens
+        audio_tokens = []
+        in_speech = False
+        for token in generated_tokens:
+            if token == start_of_speech:
+                in_speech = True
+                continue
+            elif token == end_of_speech:
+                in_speech = False
+                break
+            if in_speech and token >= 128266:  # audio_tokens_start
+                audio_tokens.append(token)
+        
+        if not audio_tokens:
+            logger.error(f"No audio tokens generated for sentence {i+1}")
+            continue
+        
+        # Decode audio tokens to waveform
+        output_waveform = decode_audio_tokens(audio_tokens, audio_tokens_start=128266)
+        if output_waveform is None:
+            logger.error(f"Failed to decode audio tokens for sentence {i+1}")
+            continue
+        
+        # Ensure output_waveform is 2D [channels, samples]
+        if output_waveform.dim() != 2:
+            output_waveform = output_waveform.view(1, -1)
+        
+        # Save output audio
+        output_path = os.path.join(args.output_folder, f"{i:03}.wav")
+        try:
+            torchaudio.save(
+                output_path,
+                output_waveform,
+                24000,
+                encoding='PCM_S',
+                bits_per_sample=16
+            )
+            logger.info(f"Successfully generated {output_path}")
+        except Exception as e:
+            logger.error(f"Error saving audio for sentence {i+1}: {e}")
+    
+    logger.info("Batch speech generation completed")
+    
 if __name__ == "__main__":
     main()
+
