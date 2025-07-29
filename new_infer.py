@@ -181,23 +181,24 @@ def generate_speech_orpheus_style(reference_audio_path, reference_text, target_t
         logger.error("Failed to tokenize reference audio")
         return None
     
-    # Define special tokens (Orpheus style)
+    # Define special tokens (matching working inference.py)
     start_tokens = torch.tensor([[128259]], dtype=torch.int64)  # start_of_human
-    end_tokens = torch.tensor([[128009, 128260, 128261, 128257]], dtype=torch.int64)  # end_of_text, end_of_human, start_of_ai, start_of_speech
-    final_tokens = torch.tensor([[128258, 128262]], dtype=torch.int64)  # end_of_speech, end_of_ai
     
     # Tokenize reference text
     logger.info(f"Encoding reference text: {reference_text[:50]}...")
     reference_prompt_tokked = tokenizer(reference_text, return_tensors="pt")
     reference_input_ids = reference_prompt_tokked["input_ids"]
     
-    # Create base prompt with reference (zeroprompt_input_ids in Orpheus)
+    # Create base prompt with reference (matching working inference.py structure)
     zeroprompt_input_ids = torch.cat([
-        start_tokens,
+        start_tokens,  # start_of_human
         reference_input_ids,
-        end_tokens,
+        torch.tensor([[128009, 128260]], dtype=torch.int64),  # end_of_text, end_of_human
+        torch.tensor([[128261]], dtype=torch.int64),  # start_of_ai
+        torch.tensor([[128257]], dtype=torch.int64),  # start_of_speech (CRITICAL!)
         torch.tensor([reference_codes]).to(torch.int64),
-        final_tokens
+        torch.tensor([[128258]], dtype=torch.int64),  # end_of_speech (CRITICAL!)
+        torch.tensor([[128262]], dtype=torch.int64)   # end_of_ai
     ], dim=1)
     
     # Prepare batch for all target texts
@@ -265,74 +266,81 @@ def generate_speech_orpheus_style(reference_audio_path, reference_text, target_t
             pad_token_id=128263
         )
     
-    # Process generated sequences
+    # Process generated sequences (matching working inference.py logic)
     results = []
     
-    for i, generated_sequence in enumerate(generated_ids):
+    for i, full_sequence in enumerate(generated_ids):
         logger.info(f"Processing generated sequence {i+1}/{len(generated_ids)}")
         
-        # Find start_of_speech token (128257) and extract audio tokens
-        token_to_find = 128257  # start_of_speech
-        token_to_remove = 128258  # end_of_speech
+        # Extract only the newly generated tokens (not the input prompt)
+        input_length = batch_input_ids[i].shape[0]
+        generated_tokens = full_sequence[input_length:].tolist()
         
-        # Find last occurrence of start_of_speech
-        token_indices = (generated_sequence == token_to_find).nonzero(as_tuple=True)
+        logger.info(f"Generated {len(generated_tokens)} new tokens")
+        logger.info(f"First 20 generated tokens: {generated_tokens[:20]}")
+        logger.info(f"Last 20 generated tokens: {generated_tokens[-20:]}")
         
-        if len(token_indices[0]) > 0:
-            last_occurrence_idx = token_indices[0][-1].item()
-            cropped_tensor = generated_sequence[last_occurrence_idx+1:]
-        else:
-            logger.warning(f"No start_of_speech token found in sequence {i+1}")
-            cropped_tensor = generated_sequence
+        # Check for key tokens
+        start_speech_count = generated_tokens.count(128257)
+        end_speech_count = generated_tokens.count(128258)
+        audio_token_count = sum(1 for t in generated_tokens if t >= 128266)
         
-        # Remove end_of_speech tokens
-        masked_tokens = cropped_tensor[cropped_tensor != token_to_remove]
+        logger.info(f"Token analysis: start_of_speech={start_speech_count}, end_of_speech={end_speech_count}, audio_tokens={audio_token_count}")
         
-        # Ensure we have audio tokens and trim to multiple of 7
-        if len(masked_tokens) > 0:
-            row_length = masked_tokens.size(0)
-            new_length = (row_length // 7) * 7
-            trimmed_tokens = masked_tokens[:new_length]
+        # Find audio tokens using working inference.py logic with fallback
+        audio_tokens = []
+        in_speech = False
+        
+        # First try: Look for speech boundary tokens (standard approach)
+        for token in generated_tokens:
+            if token == 128257:  # start_of_speech
+                logger.info(f"Found start_of_speech token")
+                in_speech = True
+                continue
+            elif token == 128258:  # end_of_speech
+                logger.info(f"Found end_of_speech token, collected {len(audio_tokens)} audio tokens so far")
+                in_speech = False
+                break  # Stop at first end_of_speech
             
-            # Convert to audio token range (matching working inference.py)
-            audio_codes = []
-            for t in trimmed_tokens:
-                # Convert tensor element to Python int (NO offset subtraction here)
-                token_val = t.item()
-                # Validate token is in reasonable range for raw tokens
-                if 128266 <= token_val <= 200000:  # Raw token range
-                    audio_codes.append(token_val)
-                else:
-                    logger.warning(f"Skipping out-of-range audio token: {token_val}")
+            if in_speech and token >= 128266:  # audio_tokens_start
+                audio_tokens.append(token)
+        
+        # Fallback: If no speech boundaries found, extract all audio tokens directly
+        if not audio_tokens and start_speech_count == 0 and audio_token_count > 0:
+            logger.info(f"No speech boundaries found, extracting all {audio_token_count} audio tokens directly")
+            audio_tokens = [token for token in generated_tokens if token >= 128266]
+        
+        if not audio_tokens:
+            logger.error(f"No audio tokens found for sequence {i+1}")
+            results.append(None)
+            continue
+        
+        logger.info(f"Found {len(audio_tokens)} audio tokens")
+        
+        # Ensure we have multiple of 7 tokens
+        if len(audio_tokens) % 7 != 0:
+            audio_tokens = audio_tokens[:-(len(audio_tokens) % 7)]
+        
+        if len(audio_tokens) >= 7:
+            logger.info(f"Decoding {len(audio_tokens)} audio tokens to waveform")
+            logger.info(f"Audio token range: {min(audio_tokens)} - {max(audio_tokens)}")
             
-            # Ensure we still have multiple of 7 after filtering
-            if len(audio_codes) >= 7:
-                # Trim to multiple of 7 again after filtering
-                final_length = (len(audio_codes) // 7) * 7
-                audio_codes = audio_codes[:final_length]
+            waveform = decode_audio_tokens(audio_tokens)
+            if waveform is not None:
+                # Handle output (ensure proper tensor format)
+                if hasattr(waveform, 'detach'):
+                    waveform = waveform.detach().squeeze().cpu()
                 
-                logger.info(f"Decoding {len(audio_codes)} audio tokens to waveform")
-                logger.info(f"Audio token range: {min(audio_codes)} - {max(audio_codes)}")
+                # Ensure waveform is 1D for torchaudio.save
+                if waveform.dim() > 1:
+                    waveform = waveform.squeeze()
                 
-                waveform = decode_audio_tokens(audio_codes)
-                if waveform is not None:
-                    # Handle Trelis-style output (ensure proper tensor format)
-                    if hasattr(waveform, 'detach'):
-                        waveform = waveform.detach().squeeze().cpu()
-                    
-                    # Ensure waveform is 1D for torchaudio.save
-                    if waveform.dim() > 1:
-                        waveform = waveform.squeeze()
-                    
-                    results.append(waveform)
-                else:
-                    logger.error(f"Failed to decode audio for sequence {i+1}")
-                    results.append(None)
+                results.append(waveform)
             else:
-                logger.error(f"Not enough valid audio tokens for sequence {i+1} (got {len(audio_codes)}, need at least 7)")
+                logger.error(f"Failed to decode audio for sequence {i+1}")
                 results.append(None)
         else:
-            logger.error(f"No audio tokens found for sequence {i+1}")
+            logger.error(f"Not enough audio tokens for sequence {i+1} (got {len(audio_tokens)}, need at least 7)")
             results.append(None)
     
     return results
