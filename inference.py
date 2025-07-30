@@ -291,9 +291,9 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
         
         logger.info(f"Decoded audio shape: {audio_hat.shape}")
         
-        # Extract audio slice (2048:4096) as done in decoder.py
+        # Extract audio slice (full decoded audio)
         if len(audio_hat.shape) == 3:
-            audio_slice = audio_hat[:, :, 2048:4096]
+            audio_slice = audio_hat[:, :, :]  # Use full decoded audio
         else:
             logger.error(f"Unexpected audio shape: {audio_hat.shape}")
             return None
@@ -302,6 +302,12 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
         
         # Convert to proper format
         audio_np = detached_audio.numpy()
+        
+        # Ensure we have the right shape for saving
+        if len(audio_np.shape) == 3:
+            audio_np = audio_np.squeeze(0)  # Remove batch dimension
+        
+        # Convert to int16 for saving
         audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
         
         # Convert back to torch tensor for torchaudio
@@ -314,6 +320,7 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
             waveform = waveform.unsqueeze(0)  # Add channel dimension
         
         logger.info(f"Final waveform shape: {waveform.shape}")
+        logger.info(f"Audio duration: {waveform.shape[-1] / 24000:.2f} seconds")
         return waveform
         
     except Exception as e:
