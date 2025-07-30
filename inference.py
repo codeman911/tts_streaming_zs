@@ -172,88 +172,98 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
 
 def generate_speech(reference_audio_path, reference_text, target_text, output_path, max_new_tokens=2000):
     """Generate speech using zero-shot voice cloning"""
-    global model, tokenizer, config
+    global model, tokenizer, snac_model, config
     
-    # Load reference audio and process SNAC codes as before
+    # Load and preprocess reference audio
     logger.info(f"Loading reference audio from {reference_audio_path}")
-    waveform, sample_rate = torchaudio.load(reference_audio_path)
-    if waveform.shape[0] > 1:  # Convert stereo to mono
-        waveform = torch.mean(waveform, dim=0, keepdim=True)
+    try:
+        waveform, sample_rate = torchaudio.load(reference_audio_path)
+        waveform = waveform.squeeze(0)
+    except Exception as e:
+        logger.error(f"Error loading reference audio: {e}")
+        return False
     
-    # Get SNAC codes for reference audio
+    # Tokenize reference audio
     logger.info("Tokenizing reference audio")
-    audio_tokens_start = config.get("audio_tokens_start", 128266)
-    reference_codes = tokenise_audio(waveform, sample_rate, audio_tokens_start)
+    reference_codes = tokenise_audio(waveform, sample_rate)
     if reference_codes is None or len(reference_codes) == 0:
         logger.error("Failed to tokenize reference audio")
         return False
     
-    # Remove duplicate frames
-    reference_codes = remove_duplicate_frames(reference_codes)
-    if reference_codes is None or len(reference_codes) == 0:
-        logger.error("No valid frames in reference audio")
-        return False
+    # Get special token IDs
+    start_of_human = tokenizer.convert_tokens_to_ids('<|start_of_human|>')
+    end_of_human = tokenizer.convert_tokens_to_ids('<|end_of_human|>')
+    start_of_ai = tokenizer.convert_tokens_to_ids('<|start_of_ai|>')
+    end_of_ai = tokenizer.convert_tokens_to_ids('<|end_of_ai|>')
+    start_of_speech = tokenizer.convert_tokens_to_ids('<|start_of_speech|>')
+    end_of_speech = tokenizer.convert_tokens_to_ids('<|end_of_speech|>')
+    end_of_text = tokenizer.convert_tokens_to_ids('<|end_of_text|>')
+    audio_tokens_start = config.get('audio_tokens_start', 128266)
     
-    # Get vocabulary size
-    vocab_size = tokenizer.vocab_size
-    logger.info(f"Model vocabulary size: {vocab_size}")
+    logger.info(f"Special token IDs: start_of_human={start_of_human}, end_of_human={end_of_human}, start_of_ai={start_of_ai}, end_of_ai={end_of_ai}")
+    logger.info(f"start_of_speech={start_of_speech}, end_of_speech={end_of_speech}, end_of_text={end_of_text}")
     
-    # Create token IDs from config
-    start_of_human = config.get("start_of_human", 128259)
-    end_of_human = config.get("end_of_human", 128260)
-    start_of_ai = config.get("start_of_ai", 128261)
-    start_of_speech = config.get("start_of_speech", 128257)
-    end_of_speech = config.get("end_of_speech", 128258)
-    end_of_ai = config.get("end_of_ai", 128262)
-    end_of_text = config.get("end_of_text", 128009)
+    # Encode reference and target text
+    logger.info("Encoding reference and target text")
+    reference_text_ids = tokenizer.encode(reference_text, add_special_tokens=False)
+    target_text_ids = tokenizer.encode(target_text, add_special_tokens=False)
     
-    # Encode texts directly without validation
-    logger.info(f"Encoding reference text: {reference_text[:50]}...")
-    reference_text_ids = tokenizer.encode(reference_text, add_special_tokens=True)
+    # Build prompt exactly as per training format
+    prompt_parts = [
+        [start_of_human],                    # Start of reference
+        reference_text_ids,                  # Reference text
+        [end_of_text, end_of_human],         # End reference
+        [start_of_ai, start_of_speech],      # Start AI + speech
+        reference_codes,                     # Reference audio tokens
+        [end_of_speech, end_of_ai],          # End speech + AI
+        [start_of_human],                    # Start of target
+        target_text_ids,                     # Target text
+        [end_of_text, end_of_human]          # End target
+    ]
     
-    logger.info(f"Encoding target text: {target_text[:50]}...")
-    target_text_ids = tokenizer.encode(target_text, add_special_tokens=True)
+    # Flatten the prompt
+    input_ids = []
+    for part in prompt_parts:
+        input_ids.extend(part)
     
-    # Create input sequence without vocabulary checks
-    input_ids = (
-        [start_of_human] 
-        + reference_text_ids 
-        + [end_of_text, end_of_human]
-        + [start_of_ai] 
-        + [start_of_speech] 
-        + reference_codes 
-        + [end_of_speech] 
-        + [end_of_ai]
-        + [start_of_human] 
-        + target_text_ids 
-        + [end_of_text, end_of_human]
-        + [start_of_ai]
-    )
+    input_ids = torch.tensor([input_ids], dtype=torch.long).to("cuda:0")
     
-    # Generate with similar parameters to test_inference.py
-    # Generate with correct parameters
-    input_tensor = torch.tensor([input_ids], device=model.device)
-    logger.info("Generating speech...")
+    # Log prompt details
+    logger.info(f"Prompt length: {len(input_ids[0])} tokens")
+    logger.info(f"First 50 tokens: {input_ids[0][:50].tolist()}")
+    logger.info(f"Last 50 tokens: {input_ids[0][-50:].tolist()}")
+    
+    # Decode and log the prompt
+    try:
+        decoded_prompt = tokenizer.decode(input_ids[0])
+        logger.info(f"Decoded prompt: {decoded_prompt[:500]}...")
+    except Exception as e:
+        logger.error(f"Error decoding prompt: {e}")
+    
+    # Generate with deterministic settings
+    logger.info("Generating speech with deterministic settings")
     with torch.inference_mode():
-        output = model.generate(
-            input_tensor,
+        generated_tokens = model.generate(
+            input_ids=input_ids,
             max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.3,
-            top_p=0.95,
-            repetition_penalty=1.1,
-            pad_token_id=config.get("pad_token", 128263),
-            eos_token_id=end_of_speech
+            do_sample=False,  # Deterministic generation
+            temperature=1.0,  # Neutral temperature
+            top_p=1.0,        # Disable top-p sampling
+            repetition_penalty=1.0,  # No repetition penalty
+            pad_token_id=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            forced_bos_token_id=start_of_ai  # Force start with start_of_ai
         )
-        logger.info(f"Raw model output shape: {output.shape}")
-        logger.info(f"Raw model output first 50 tokens: {output[0][:50].tolist()}")
     
-        # Extract generated tokens (only the new ones)
-        generated_tokens = output[0][len(input_ids):].tolist()
-        logger.info(f"Number of generated tokens: {len(generated_tokens)}")
-        logger.info(f"First 50 generated tokens: {generated_tokens[:50]}")
+    # Extract only the new tokens
+    new_tokens = generated_tokens[0][len(input_ids[0]):]
+    logger.info(f"Generated {len(new_tokens)} new tokens")
+    
+    # Log first 50 generated tokens
+    if len(new_tokens) > 0:
+        logger.info(f"First 50 generated tokens: {new_tokens[:50].tolist()}")
         try:
-            logger.info(f"Generated text: {tokenizer.decode(generated_tokens[:50])}...")
+            logger.info(f"Generated text: {tokenizer.decode(new_tokens[:50])}...")
         except Exception as e:
             logger.error(f"Error decoding generated tokens: {e}")
     
@@ -261,7 +271,7 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
     audio_tokens = []
     in_speech = False
     
-    for token in generated_tokens:
+    for token in new_tokens:
         if token == start_of_speech:
             in_speech = True
             continue
@@ -269,12 +279,15 @@ def generate_speech(reference_audio_path, reference_text, target_text, output_pa
             in_speech = False
             break
         
-        if in_speech and token >= audio_tokens_start:  # Removed vocab_size check since we're using extended vocabulary
+        if in_speech and token >= audio_tokens_start:
             audio_tokens.append(token)
     
     if not audio_tokens:
         logger.error("No audio tokens generated")
+        logger.error(f"Generated tokens: {new_tokens.tolist()}")
         return False
+    
+    logger.info(f"Found {len(audio_tokens)} audio tokens")
     
     # Decode audio tokens to waveform
     logger.info("Decoding audio tokens to waveform")
