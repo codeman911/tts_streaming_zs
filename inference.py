@@ -247,34 +247,42 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
         
         num_frames = len(tokens) // 7
         
-        # Build codes arrays properly for SNAC
-        codes_0 = []
-        codes_1 = []
-        codes_2 = []
+        # Build codes arrays exactly as in decoder.py
+        codes_0 = torch.tensor([], device="cuda:0", dtype=torch.int32)
+        codes_1 = torch.tensor([], device="cuda:0", dtype=torch.int32)
+        codes_2 = torch.tensor([], device="cuda:0", dtype=torch.int32)
         
-        for i in range(num_frames):
-            frame_start = i * 7
+        for j in range(num_frames):
+            i = 7 * j
             
             # Layer 0: position 0
-            codes_0.append(int(tokens[frame_start]))
+            if codes_0.shape[0] == 0:
+                codes_0 = torch.tensor([int(tokens[i])], device="cuda:0", dtype=torch.int32)
+            else:
+                codes_0 = torch.cat([codes_0, torch.tensor([int(tokens[i])], device="cuda:0", dtype=torch.int32)])
             
             # Layer 1: positions 1, 4
-            codes_1.append(int(tokens[frame_start + 1]))
-            codes_1.append(int(tokens[frame_start + 4]))
+            if codes_1.shape[0] == 0:
+                codes_1 = torch.tensor([int(tokens[i+1])], device="cuda:0", dtype=torch.int32)
+                codes_1 = torch.cat([codes_1, torch.tensor([int(tokens[i+4])], device="cuda:0", dtype=torch.int32)])
+            else:
+                codes_1 = torch.cat([codes_1, torch.tensor([int(tokens[i+1])], device="cuda:0", dtype=torch.int32)])
+                codes_1 = torch.cat([codes_1, torch.tensor([int(tokens[i+4])], device="cuda:0", dtype=torch.int32)])
             
             # Layer 2: positions 2, 3, 5, 6
-            codes_2.append(int(tokens[frame_start + 2]))
-            codes_2.append(int(tokens[frame_start + 3]))
-            codes_2.append(int(tokens[frame_start + 5]))
-            codes_2.append(int(tokens[frame_start + 6]))
+            if codes_2.shape[0] == 0:
+                codes_2 = torch.tensor([int(tokens[i+2])], device="cuda:0", dtype=torch.int32)
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+3])], device="cuda:0", dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+5])], device="cuda:0", dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+6])], device="cuda:0", dtype=torch.int32)])
+            else:
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+2])], device="cuda:0", dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+3])], device="cuda:0", dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+5])], device="cuda:0", dtype=torch.int32)])
+                codes_2 = torch.cat([codes_2, torch.tensor([int(tokens[i+6])], device="cuda:0", dtype=torch.int32)])
         
-        # Convert to tensors with correct shape for SNAC
-        # SNAC expects: [batch_size, sequence_length] for each layer
-        codes = [
-            torch.tensor(codes_0, dtype=torch.long).unsqueeze(0).to("cuda:0"),  # [1, num_frames]
-            torch.tensor(codes_1, dtype=torch.long).unsqueeze(0).to("cuda:0"),  # [1, num_frames*2]
-            torch.tensor(codes_2, dtype=torch.long).unsqueeze(0).to("cuda:0")   # [1, num_frames*4]
-        ]
+        # Create codes list exactly as in decoder.py
+        codes = [codes_0.unsqueeze(0), codes_1.unsqueeze(0), codes_2.unsqueeze(0)]
         
         logger.info(f"SNAC codes shapes: {[c.shape for c in codes]}")
         logger.info(f"SNAC codes ranges: {[f'{c.min().item()}-{c.max().item()}' for c in codes]}")
@@ -291,33 +299,32 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
         
         logger.info(f"Decoded audio shape: {audio_hat.shape}")
         
-        # Extract audio slice (full decoded audio)
+        # Use full decoded audio instead of slicing to 2048 samples
         if len(audio_hat.shape) == 3:
-            audio_slice = audio_hat[:, :, :]  # Use full decoded audio
+            audio_slice = audio_hat[:, :, :]  # Use full audio
         else:
             logger.error(f"Unexpected audio shape: {audio_hat.shape}")
             return None
             
         detached_audio = audio_slice.detach().cpu()
-        
-        # Convert to proper format
         audio_np = detached_audio.numpy()
         
-        # Ensure we have the right shape for saving
+        # Ensure we have the right shape
         if len(audio_np.shape) == 3:
             audio_np = audio_np.squeeze(0)  # Remove batch dimension
         
-        # Convert to int16 for saving
-        audio_int16 = np.clip(audio_np * 32767, -32768, 32767).astype(np.int16)
+        # Convert to int16 and back to float for proper scaling
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        audio_float = audio_int16.astype(np.float32) / 32767.0
         
-        # Convert back to torch tensor for torchaudio
-        waveform = torch.from_numpy(audio_int16.astype(np.float32) / 32767.0)
+        # Convert to torch tensor
+        waveform = torch.from_numpy(audio_float)
         
         # Ensure proper shape for torchaudio: [channels, samples]
-        if waveform.dim() == 3:
-            waveform = waveform.squeeze(0)  # Remove batch dimension
         if waveform.dim() == 1:
-            waveform = waveform.unsqueeze(0)  # Add channel dimension
+            waveform = waveform.unsqueeze(0)
+        elif waveform.dim() == 3:
+            waveform = waveform.squeeze(0)
         
         logger.info(f"Final waveform shape: {waveform.shape}")
         logger.info(f"Audio duration: {waveform.shape[-1] / 24000:.2f} seconds")
@@ -326,7 +333,6 @@ def decode_audio_tokens(audio_tokens, audio_tokens_start=128266):
     except Exception as e:
         logger.error(f"Error decoding audio tokens: {str(e)}")
         logger.error(f"Audio tokens count: {len(audio_tokens) if audio_tokens else 0}")
-        logger.error(f"Token range: {min(audio_tokens) if audio_tokens else 'None'} - {max(audio_tokens) if audio_tokens else 'None'}")
         return None
 
 def build_reference_prompt(reference_text, reference_codes, token_map):
